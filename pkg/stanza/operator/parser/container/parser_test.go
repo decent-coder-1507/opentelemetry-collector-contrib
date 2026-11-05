@@ -2031,3 +2031,38 @@ func TestParseCRIOFields(t *testing.T) {
 		})
 	}
 }
+
+// TestRecombinedRecordsAreNotHeldInEmitter guards against large recombined CRI records
+// piling up in the internal batching emitter until its flush interval
+// (https://github.com/open-telemetry/opentelemetry-collector-contrib/issues/52315).
+func TestRecombinedRecordsAreNotHeldInEmitter(t *testing.T) {
+	cfg := NewConfigWithID("test_id")
+	cfg.AddMetadataFromFilePath = false
+	op, err := cfg.Build(componenttest.NewNopTelemetrySettings())
+	require.NoError(t, err)
+	defer func() { require.NoError(t, op.Stop()) }()
+	p := op.(*Parser)
+	fake := testutil.NewFakeOutput(t)
+	p.OutputOperators = []operator.Operator{fake}
+
+	// 16 lines x 64 KiB = one record of exactly defaultMaxLogSize (1 MiB).
+	const linesPerRecord, records = 16, 5
+	body := strings.Repeat("a", defaultMaxLogSize/linesPerRecord)
+	for i := range records {
+		for j := range linesPerRecord {
+			logtag := "P"
+			if j == linesPerRecord-1 {
+				logtag = "F"
+			}
+			e := entry.New()
+			e.Body = "2029-03-30T08:31:20.545192187Z stdout " + logtag + " " + body
+			e.Attributes = map[string]any{attrs.LogFilePath: "/var/log/pods/ns_pod_uid/container/0.log"}
+			require.NoError(t, p.Process(t.Context(), e))
+		}
+		require.Len(t, fake.Received, i+1, "record %d should be emitted without waiting for the flush interval", i)
+	}
+	for range records {
+		e := <-fake.Received
+		require.Len(t, e.Body, defaultMaxLogSize)
+	}
+}

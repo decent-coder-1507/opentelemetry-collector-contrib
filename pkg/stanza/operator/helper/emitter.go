@@ -29,8 +29,10 @@ type BatchingLogEmitter struct {
 	stopOnce      sync.Once
 	batchMux      sync.Mutex
 	batch         []*entry.Entry
+	batchBytes    uint
 	wg            sync.WaitGroup
 	maxBatchSize  uint
+	maxBatchBytes uint
 	flushInterval time.Duration
 	consumerFunc  func(context.Context, []*entry.Entry)
 }
@@ -38,6 +40,9 @@ type BatchingLogEmitter struct {
 var (
 	defaultFlushInterval      = 100 * time.Millisecond
 	defaultMaxBatchSize  uint = 100
+	// defaultMaxBatchBytes bounds the string/[]byte body bytes held in a batch, so that
+	// large entries (e.g. recombined container logs) are not buffered 100 at a time.
+	defaultMaxBatchBytes uint = 1024 * 1024
 )
 
 type EmitterOption interface {
@@ -54,6 +59,20 @@ type maxBatchSizeOption struct {
 
 func (o maxBatchSizeOption) apply(e *BatchingLogEmitter) {
 	e.maxBatchSize = o.maxBatchSize
+}
+
+// WithMaxBatchBytes sets the number of body bytes (string or []byte bodies) after which
+// a batch is flushed, regardless of its entry count. Zero disables the limit.
+func WithMaxBatchBytes(maxBatchBytes uint) EmitterOption {
+	return maxBatchBytesOption{maxBatchBytes}
+}
+
+type maxBatchBytesOption struct {
+	maxBatchBytes uint
+}
+
+func (o maxBatchBytesOption) apply(e *BatchingLogEmitter) {
+	e.maxBatchBytes = o.maxBatchBytes
 }
 
 func WithFlushInterval(flushInterval time.Duration) EmitterOption {
@@ -74,6 +93,7 @@ func NewBatchingLogEmitter(set component.TelemetrySettings, consumerFunc func(co
 	e := &BatchingLogEmitter{
 		OutputOperator: op,
 		maxBatchSize:   defaultMaxBatchSize,
+		maxBatchBytes:  defaultMaxBatchBytes,
 		batch:          make([]*entry.Entry, 0, defaultMaxBatchSize),
 		flushInterval:  defaultFlushInterval,
 		consumerFunc:   consumerFunc,
@@ -116,17 +136,20 @@ func (e *BatchingLogEmitter) ProcessBatch(ctx context.Context, entries []*entry.
 	return nil
 }
 
-// appendEntries appends the entry to the current batch. If maxBatchSize is reached, a new batch will be made, and the old batch
-// (which should be flushed) will be returned
+// appendEntries appends the entry to the current batch. If maxBatchSize or maxBatchBytes is reached, a new batch will be made,
+// and the old batch (which should be flushed) will be returned
 func (e *BatchingLogEmitter) appendEntries(entries []*entry.Entry) []*entry.Entry {
 	e.batchMux.Lock()
 	defer e.batchMux.Unlock()
 
 	e.batch = append(e.batch, entries...)
-	if uint(len(e.batch)) >= e.maxBatchSize {
-		var oldBatch []*entry.Entry
-		oldBatch, e.batch = e.batch, make([]*entry.Entry, 0, e.maxBatchSize)
-		return oldBatch
+	if e.maxBatchBytes > 0 {
+		for _, ent := range entries {
+			e.batchBytes += bodySize(ent)
+		}
+	}
+	if e.batchFull() {
+		return e.swapBatch()
 	}
 
 	return nil
@@ -141,20 +164,48 @@ func (e *BatchingLogEmitter) Process(ctx context.Context, ent *entry.Entry) erro
 	return nil
 }
 
-// appendEntry appends the entry to the current batch. If maxBatchSize is reached, a new batch will be made, and the old batch
-// (which should be flushed) will be returned
+// appendEntry appends the entry to the current batch. If maxBatchSize or maxBatchBytes is reached, a new batch will be made,
+// and the old batch (which should be flushed) will be returned
 func (e *BatchingLogEmitter) appendEntry(ent *entry.Entry) []*entry.Entry {
 	e.batchMux.Lock()
 	defer e.batchMux.Unlock()
 
 	e.batch = append(e.batch, ent)
-	if uint(len(e.batch)) >= e.maxBatchSize {
-		var oldBatch []*entry.Entry
-		oldBatch, e.batch = e.batch, make([]*entry.Entry, 0, e.maxBatchSize)
-		return oldBatch
+	if e.maxBatchBytes > 0 {
+		e.batchBytes += bodySize(ent)
+	}
+	if e.batchFull() {
+		return e.swapBatch()
 	}
 
 	return nil
+}
+
+// batchFull reports whether the current batch has reached maxBatchSize entries or maxBatchBytes body bytes.
+// The caller must hold batchMux.
+func (e *BatchingLogEmitter) batchFull() bool {
+	return uint(len(e.batch)) >= e.maxBatchSize || (e.maxBatchBytes > 0 && e.batchBytes >= e.maxBatchBytes)
+}
+
+// swapBatch replaces the current batch with a new, empty one and returns the old one.
+// The caller must hold batchMux.
+func (e *BatchingLogEmitter) swapBatch() []*entry.Entry {
+	var oldBatch []*entry.Entry
+	oldBatch, e.batch = e.batch, make([]*entry.Entry, 0, e.maxBatchSize)
+	e.batchBytes = 0
+	return oldBatch
+}
+
+// bodySize returns the length of a string or []byte body, and 0 for any other body type.
+func bodySize(ent *entry.Entry) uint {
+	switch b := ent.Body.(type) {
+	case string:
+		return uint(len(b))
+	case []byte:
+		return uint(len(b))
+	default:
+		return 0
+	}
 }
 
 // flusher flushes the current batch every flush interval. Intended to be run as a goroutine
@@ -193,9 +244,7 @@ func (e *BatchingLogEmitter) makeNewBatch() []*entry.Entry {
 		return nil
 	}
 
-	var oldBatch []*entry.Entry
-	oldBatch, e.batch = e.batch, make([]*entry.Entry, 0, e.maxBatchSize)
-	return oldBatch
+	return e.swapBatch()
 }
 
 // SynchronousLogEmitter is a stanza operator that emits log entries to the consumer callback function `consumerFunc` synchronously
